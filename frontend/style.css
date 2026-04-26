@@ -131,8 +131,8 @@ body {
     radial-gradient(520px 320px at 50% 60%, rgba(255,255,255,0.04), transparent 70%),
     conic-gradient(from 210deg at 50% 55%,
       color-mix(in srgb, var(--accent) 20%, transparent),
-      rgba(61,245,255,0.08),
-      rgba(124,44,255,0.10),
+      color-mix(in srgb, var(--accent) 10%, transparent),
+      color-mix(in srgb, var(--accent) 14%, transparent),
       color-mix(in srgb, var(--accent) 16%, transparent),
       color-mix(in srgb, var(--accent) 20%, transparent)
     );
@@ -142,10 +142,11 @@ body {
 .glow {
   position: absolute;
   inset: -40%;
+  /* All layers follow --accent / --accentSoft (no fixed purple/cyan chips). */
   background:
     radial-gradient(circle at 50% 55%, var(--accentSoft), transparent 58%),
-    radial-gradient(circle at 35% 40%, rgba(61,245,255,0.18), transparent 50%),
-    radial-gradient(circle at 70% 35%, rgba(124,44,255,0.18), transparent 52%);
+    radial-gradient(circle at 35% 40%, color-mix(in srgb, var(--accent) 22%, transparent), transparent 50%),
+    radial-gradient(circle at 70% 35%, color-mix(in srgb, var(--accent) 18%, transparent), transparent 52%);
   filter: blur(10px);
   opacity: 0.55;
   transform: scale(0.92);

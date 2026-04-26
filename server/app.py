@@ -25,7 +25,7 @@ import sys
 import json
 import math
 import numpy as np
-from typing import Optional
+from typing import List, Optional, Tuple
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 import time
@@ -156,17 +156,19 @@ def _get_ecg_source(source: str, device_id: Optional[str]):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _downsample_for_display(signal: np.ndarray, target_points: int = 1500
-                            ) -> list:
+def _downsample_for_display(
+    signal: np.ndarray, target_points: int = 1500
+) -> Tuple[List, int]:
     """
-    The raw ECG has 15,360 samples. Sending all of them to the browser
-    works but bloats payload. Downsample for plotting only — actual
-    R-peak detection runs on the full signal server-side.
+    Return (samples for plotting, stride used). Stride is required so the client
+    can time-scroll at real-world speed (fs / step = effective points per second
+    in the downsampled buffer), matching demo and upload.
     """
-    if len(signal) <= target_points:
-        return signal.tolist()
-    step = max(1, len(signal) // target_points)
-    return signal[::step].tolist()
+    n = len(signal)
+    if n <= target_points:
+        return signal.tolist(), 1
+    step = max(1, n // target_points)
+    return signal[::step].tolist(), step
 
 def _json_sanitize(value):
     """
@@ -246,8 +248,7 @@ def _run_full_pipeline(ecg: np.ndarray,
                         hr_result["rr_intervals_s"])
 
     # Convert ndarray -> list for JSON, downsample ECG for plotting
-    ecg_display = _downsample_for_display(ecg, target_points=1500)
-    display_step = max(1, len(ecg) // len(ecg_display))
+    ecg_display, display_step = _downsample_for_display(ecg, target_points=1500)
     # R-peak indices need to map onto the downsampled x-axis
     r_peaks_display = (hr_result["r_peaks"] // display_step).tolist()
 
@@ -318,6 +319,30 @@ def analyze():
     out["meta"] = meta
     return jsonify(_json_sanitize(out))
 
+
+@app.route("/api/led", methods=["GET"])
+def led_state():
+    """
+    Small JSON for microcontrollers (no ECG array). Same query as /api/analyze:
+      source: demo | daq | upload
+      deviceId: required when source=upload
+    """
+    source = str(request.args.get("source", "demo"))
+    device_id = request.args.get("deviceId")
+    sig, fs, meta = _get_ecg_source(source, device_id)
+    if sig is None:
+        return jsonify({"error": meta.get("error", "not_found"), "meta": meta}), 404
+
+    out = _run_full_pipeline(sig, fs)
+    _finalize_upload_health_bpm_if_any(out, meta, source, sig, fs)
+    brief = {
+        "heart_rate": out.get("heart_rate"),
+        "emotion": out.get("emotion"),
+        "meta": meta,
+    }
+    return jsonify(_json_sanitize(brief))
+
+
 @app.route("/api/ecg", methods=["POST"])
 def upload_ecg():
     """
@@ -375,12 +400,13 @@ def get_latest_ecg():
 
     sig = item["samples_uV"]
     fs = item["fs"]
-    samples = _downsample_for_display(sig, target_points=1600)
+    samples, dstep = _downsample_for_display(sig, target_points=1600)
     return jsonify(_json_sanitize({
         "deviceId": device_id,
         "ts": item.get("ts"),
         "fs": fs,
         "samples": samples,
+        "display_step": int(dstep),
         "n_original_samples": int(len(sig)),
         "duration_s": float(len(sig) / fs) if fs else None,
         "received_at": float(item.get("received_at") or 0),
@@ -400,10 +426,11 @@ def waveform():
     if sig is None:
         return jsonify({"error": meta.get("error", "not_found"), "meta": meta}), 404
 
-    samples = _downsample_for_display(sig, target_points=1600)
+    samples, dstep = _downsample_for_display(sig, target_points=1600)
     return jsonify(_json_sanitize({
         "fs": fs,
         "samples": samples,
+        "display_step": int(dstep),
         "n_original_samples": int(len(sig)),
         "duration_s": float(len(sig) / fs) if fs else None,
         "meta": meta,
@@ -425,10 +452,11 @@ def live_waveform():
 
     sig = live["ecg"]
     fs = live["fs"]
-    samples = _downsample_for_display(sig, target_points=1600)
+    samples, dstep = _downsample_for_display(sig, target_points=1600)
     return jsonify(_json_sanitize({
         "fs": fs,
         "samples": samples,
+        "display_step": int(dstep),
         "n_original_samples": int(len(sig)),
         "duration_s": float(len(sig) / fs) if fs else None,
         "mtime": float(live["mtime"]),

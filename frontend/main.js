@@ -36,6 +36,14 @@ let attackPhase = false;
 const STALE_AFTER_MS = 4000;
 let lastGoodAt = 0;
 
+// Scrolling ECG (time-correct: matches recording duration, demo vs upload)
+const WINDOW_S = 2.0;
+let fullSamples = [];
+let displaySampleRate = 256;
+let playheadStartedAt = 0;
+/** @type {number | null} */
+let scopeRafId = null;
+
 function setError(message) {
   if (!message) {
     errorBoxEl.hidden = true;
@@ -191,6 +199,138 @@ const EMOTIONS = EMOTION_ORDER.map((id) => {
   };
 });
 
+function stopScopeAnimation() {
+  if (scopeRafId !== null) cancelAnimationFrame(scopeRafId);
+  scopeRafId = null;
+}
+
+function startScopeAnimation() {
+  if (scopeRafId !== null) return;
+  playheadStartedAt = performance.now();
+  const tick = (now) => {
+    drawScrollingScope(now);
+    scopeRafId = requestAnimationFrame(tick);
+  };
+  scopeRafId = requestAnimationFrame(tick);
+}
+
+function drawScrollingScope(nowMs) {
+  const ctx = waveCanvas.getContext("2d");
+  if (!ctx) return;
+  const dpr = window.devicePixelRatio || 1;
+  const rect = waveCanvas.getBoundingClientRect();
+  const w = Math.max(1, Math.floor(rect.width * dpr));
+  const h = Math.max(1, Math.floor(rect.height * dpr));
+  if (waveCanvas.width !== w) waveCanvas.width = w;
+  if (waveCanvas.height !== h) waveCanvas.height = h;
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = "rgba(255,255,255,0.08)";
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 10; i++) {
+    const x = Math.round((w * i) / 10) + 0.5;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+  }
+  for (let i = 1; i < 6; i++) {
+    const y = Math.round((h * i) / 6) + 0.5;
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(w, y);
+    ctx.stroke();
+  }
+  if (!fullSamples.length) return;
+
+  const totalSeconds = fullSamples.length / displaySampleRate;
+  const elapsedMs = nowMs - playheadStartedAt;
+  const elapsedS = (elapsedMs / 1000) % Math.max(totalSeconds, 0.001);
+  const playheadIdx = Math.floor(elapsedS * displaySampleRate);
+
+  const windowSamples = Math.max(2, Math.floor(WINDOW_S * displaySampleRate));
+  const startIdx = playheadIdx - windowSamples;
+
+  const visible = new Array(windowSamples);
+  for (let i = 0; i < windowSamples; i++) {
+    let idx = startIdx + i;
+    while (idx < 0) idx += fullSamples.length;
+    while (idx >= fullSamples.length) idx -= fullSamples.length;
+    visible[i] = fullSamples[idx];
+  }
+
+  let minV = Infinity;
+  let maxV = -Infinity;
+  for (const v of visible) {
+    if (v < minV) minV = v;
+    if (v > maxV) maxV = v;
+  }
+  if (!Number.isFinite(minV) || !Number.isFinite(maxV)) {
+    minV = -1;
+    maxV = 1;
+  }
+  const span = Math.max(maxV - minV, 200);
+  const center = (maxV + minV) / 2;
+  minV = center - span / 2;
+  maxV = center + span / 2;
+  const pad = (maxV - minV) * 0.1;
+  minV -= pad;
+  maxV += pad;
+
+  const accent =
+    getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#ff2d55";
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = Math.max(1.5, Math.round(1.8 * dpr));
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+
+  const n = visible.length;
+  const xScale = (w - 2) / Math.max(1, n - 1);
+  const yScale = (h - 2) / (maxV - minV);
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = 1 + i * xScale;
+    const y = 1 + (maxV - visible[i]) * yScale;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+/**
+ * @param {Record<string, unknown>} ecgPayload — shape from /api/analyze `ecg` or /api/waveform
+ */
+function adoptWaveformFromEcgPayload(ecgPayload) {
+  const samples = ecgPayload?.samples_uV;
+  if (!Array.isArray(samples) || !samples.length) {
+    fullSamples = [];
+    stopScopeAnimation();
+    return;
+  }
+  const fs = Number(ecgPayload.sampling_rate);
+  const step = Number(ecgPayload.display_step) || 1;
+  const dur = Number(ecgPayload.duration_s);
+  const n0 = Number(ecgPayload.n_original_samples);
+  const n = samples.length;
+
+  fullSamples = /** @type {number[]} */ (samples);
+  if (Number.isFinite(dur) && dur > 0 && n > 0) {
+    displaySampleRate = n / dur;
+  } else {
+    const fs0 = Number.isFinite(fs) && fs > 0 ? fs : 256;
+    displaySampleRate = fs0 / (step > 0 ? step : 1);
+  }
+
+  playheadStartedAt = performance.now();
+  waveInfoTextEl.textContent =
+    `${Number.isFinite(dur) ? dur.toFixed(1) : "—"}s @ ${Number.isFinite(fs) ? fs.toFixed(0) : "—"}Hz` +
+    (Number.isFinite(n0) ? ` • ${n0} samples` : "") +
+    ` • scope ${WINDOW_S}s`;
+
+  startScopeAnimation();
+}
+
 function renderDemoButtons() {
   demoButtonsEl.innerHTML = "";
   for (const emo of EMOTIONS) {
@@ -213,6 +353,8 @@ function applyEmotionDemo(emo) {
   timer = null;
   if (waveTimer) window.clearInterval(waveTimer);
   waveTimer = null;
+  stopScopeAnimation();
+  fullSamples = [];
 
   demoMode = true;
   lastBpm = null;
@@ -289,6 +431,9 @@ async function fetchFromClaudiacOnce() {
       } else {
         applyHeartThemeFromBpm(bpm);
       }
+      if (data?.ecg) {
+        adoptWaveformFromEcgPayload(/** @type {Record<string, unknown>} */ (data.ecg));
+      }
       setStatus("connected", "ok");
       applyBpm(bpm, `/api/analyze?source=${source}${source === "upload" ? `&deviceId=${encodeURIComponent(deviceId)}` : ""}`);
       lastBpm = bpm;
@@ -300,6 +445,9 @@ async function fetchFromClaudiacOnce() {
       applyEmotionFromServer(emo);
     } else {
       document.documentElement.dataset.demo = "";
+    }
+    if (data?.ecg) {
+      adoptWaveformFromEcgPayload(/** @type {Record<string, unknown>} */ (data.ecg));
     }
     bpmValueEl.textContent = "—";
     sourceTextEl.textContent = "connected (no bpm yet)";
@@ -331,77 +479,6 @@ async function fetchFromClaudiacOnce() {
   }
 }
 
-function drawWaveform(samples) {
-  const ctx = waveCanvas.getContext("2d");
-  if (!ctx) return;
-
-  const dpr = window.devicePixelRatio || 1;
-  const rect = waveCanvas.getBoundingClientRect();
-  const w = Math.max(1, Math.floor(rect.width * dpr));
-  const h = Math.max(1, Math.floor(rect.height * dpr));
-  if (waveCanvas.width !== w) waveCanvas.width = w;
-  if (waveCanvas.height !== h) waveCanvas.height = h;
-
-  ctx.clearRect(0, 0, w, h);
-
-  // Background grid
-  ctx.globalAlpha = 1;
-  ctx.strokeStyle = "rgba(255,255,255,0.08)";
-  ctx.lineWidth = 1;
-  const gridX = 10;
-  const gridY = 6;
-  for (let i = 1; i < gridX; i++) {
-    const x = Math.round((w * i) / gridX) + 0.5;
-    ctx.beginPath();
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, h);
-    ctx.stroke();
-  }
-  for (let i = 1; i < gridY; i++) {
-    const y = Math.round((h * i) / gridY) + 0.5;
-    ctx.beginPath();
-    ctx.moveTo(0, y);
-    ctx.lineTo(w, y);
-    ctx.stroke();
-  }
-
-  if (!samples?.length) return;
-
-  let min = Infinity;
-  let max = -Infinity;
-  for (const v of samples) {
-    if (v < min) min = v;
-    if (v > max) max = v;
-  }
-  if (!Number.isFinite(min) || !Number.isFinite(max) || min === max) {
-    min = -1;
-    max = 1;
-  }
-  // Pad so trace doesn't touch edges.
-  const pad = (max - min) * 0.1;
-  min -= pad;
-  max += pad;
-
-  const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#ff2d55";
-  ctx.strokeStyle = accent;
-  ctx.lineWidth = Math.max(1, Math.round(1.5 * dpr));
-  ctx.lineJoin = "round";
-  ctx.lineCap = "round";
-
-  const n = samples.length;
-  const xScale = (w - 2) / Math.max(1, n - 1);
-  const yScale = (h - 2) / (max - min);
-
-  ctx.beginPath();
-  for (let i = 0; i < n; i++) {
-    const x = 1 + i * xScale;
-    const y = 1 + (max - samples[i]) * yScale;
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  }
-  ctx.stroke();
-}
-
 async function fetchWaveformOnce(force = false) {
   if (demoMode) return;
   const baseUrl = API_BASE_URL.replace(/\/+$/, "");
@@ -417,7 +494,7 @@ async function fetchWaveformOnce(force = false) {
     if (!res.ok) {
       if (res.status === 404) {
         waveInfoTextEl.textContent = "no live capture yet";
-        drawWaveform([]);
+        fullSamples = [];
         return;
       }
       throw new Error(`${res.status} ${res.statusText}`);
@@ -428,14 +505,13 @@ async function fetchWaveformOnce(force = false) {
     if (!force && mtime && mtime === lastWaveMtime) return;
     lastWaveMtime = mtime || lastWaveMtime;
 
-    const fs = Number(data?.fs);
-    const n0 = Number(data?.n_original_samples);
-    const dur = Number(data?.duration_s);
-    waveInfoTextEl.textContent =
-      `${Number.isFinite(dur) ? dur.toFixed(1) : "—"}s @ ${Number.isFinite(fs) ? fs.toFixed(0) : "—"}Hz` +
-      (Number.isFinite(n0) ? ` • ${n0} samples` : "");
-
-    drawWaveform(Array.isArray(data?.samples) ? data.samples : []);
+    adoptWaveformFromEcgPayload({
+      samples_uV: data?.samples,
+      sampling_rate: data?.fs,
+      display_step: data?.display_step,
+      duration_s: data?.duration_s,
+      n_original_samples: data?.n_original_samples,
+    });
   } catch {
     waveInfoTextEl.textContent = "waveform unavailable";
   }
@@ -447,6 +523,7 @@ function connect() {
 
   demoMode = false;
   stopAttackMode();
+  stopScopeAnimation();
 
   setStatus("connecting…", "muted");
   setError("");
