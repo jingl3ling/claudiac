@@ -22,9 +22,11 @@ or have the frontend fetch from the same URL.
 
 import os
 import sys
+import math
 import numpy as np
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
+import time
 
 # Make `algorithms` importable when running from the project root
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -57,6 +59,68 @@ def _load_ecg():
 
 ECG = _load_ecg()
 
+API_KEY = os.environ.get("API_KEY", "").strip()
+
+def _require_api_key(req) -> bool:
+    if not API_KEY:
+        return True
+    provided = (req.headers.get("x-api-key") or "").strip()
+    return provided == API_KEY
+
+# Latest uploaded ECGs (e.g. from iOS ECGIngest). Stored in-memory.
+# Shape: { deviceId: { "ts": str, "fs": float, "samples_uV": np.ndarray, "received_at": float } }
+UPLOADED_ECG = {}
+
+def _load_live_ecg_if_present():
+    """
+    Read the latest DAQ capture saved by `daq.py` (data/live_ecg.npz).
+    This file is written when the user presses 's' in the DAQ window.
+    """
+    live_path = os.path.join(ROOT, "data", "live_ecg.npz")
+    if not os.path.exists(live_path):
+        return None
+
+    try:
+        d = np.load(live_path)
+    except Exception:
+        # File may be partially written/corrupted; treat as missing for the UI.
+        return None
+    # Prefer normalized for display (more stable y-range), but keep raw if needed later.
+    ecg = d["ecg"].astype(float) if "ecg" in d.files else d["ecg_raw"].astype(float)
+    fs = float(d["fs"]) if "fs" in d.files else float(ECG["sampling_rate"])
+    mtime = os.path.getmtime(live_path)
+    return {"ecg": ecg, "fs": fs, "mtime": mtime, "path": live_path}
+
+def _get_ecg_source(source: str, device_id: str | None):
+    """
+    Returns (signal_uV: np.ndarray, fs: float, meta: dict) or (None, None, meta) when missing.
+    source: "demo" | "daq" | "upload"
+    """
+    source = (source or "demo").strip().lower()
+
+    if source == "upload":
+        did = (device_id or "").strip()
+        if not did:
+            return None, None, {"source": "upload", "error": "missing_deviceId"}
+        item = UPLOADED_ECG.get(did)
+        if not item:
+            return None, None, {"source": "upload", "error": "not_found", "deviceId": did}
+        return item["samples_uV"], item["fs"], {
+            "source": "upload",
+            "deviceId": did,
+            "ts": item.get("ts"),
+            "received_at": item.get("received_at"),
+        }
+
+    if source == "daq":
+        live = _load_live_ecg_if_present()
+        if not live:
+            return None, None, {"source": "daq", "error": "not_found"}
+        return live["ecg"], live["fs"], {"source": "daq", "mtime": live["mtime"]}
+
+    # default: demo bundle
+    return ECG["voltage_uV"], ECG["sampling_rate"], {"source": "demo"}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -73,13 +137,42 @@ def _downsample_for_display(signal: np.ndarray, target_points: int = 1500
     step = max(1, len(signal) // target_points)
     return signal[::step].tolist()
 
+def _json_sanitize(value):
+    """
+    Make responses JSON-strict. numpy / Python can emit `NaN` / `Inf`, which
+    are not valid JSON and break `fetch().json()`.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        return None
+    if isinstance(value, (np.floating,)):
+        x = float(value)
+        if math.isfinite(x):
+            return x
+        return None
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, np.ndarray):
+        return _json_sanitize(value.tolist())
+    if isinstance(value, dict):
+        return {str(k): _json_sanitize(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_sanitize(v) for v in value]
+    return value
 
-def _run_full_pipeline(self_report: dict = None,
+
+def _run_full_pipeline(ecg: np.ndarray,
+                       fs: float,
+                       self_report: dict = None,
                        context: dict = None) -> dict:
     """Run heart_rate -> mood -> risk and return everything in one bundle."""
-    ecg = ECG["voltage_uV"]
-    fs = ECG["sampling_rate"]
-
     hr_result = pan_tompkins(ecg, fs)
     mood = infer_mood(hr_result["heart_rate_bpm"],
                       hr_result["hrv_sdnn_ms"],
@@ -126,8 +219,132 @@ def health():
 
 @app.route("/api/analyze", methods=["GET"])
 def analyze():
-    """Full pipeline run with default mock self-report and context."""
-    return jsonify(_run_full_pipeline())
+    """
+    Full pipeline run.
+
+    Query params:
+      - source: demo | daq | upload
+      - deviceId: required when source=upload
+    """
+    source = str(request.args.get("source", "demo"))
+    device_id = request.args.get("deviceId")
+    sig, fs, meta = _get_ecg_source(source, device_id)
+    if sig is None:
+        return jsonify({"error": meta.get("error", "not_found"), "meta": meta}), 404
+
+    out = _run_full_pipeline(sig, fs)
+    out["meta"] = meta
+    return jsonify(_json_sanitize(out))
+
+@app.route("/api/ecg", methods=["POST"])
+def upload_ecg():
+    """
+    Upload ECG waveform (e.g. from iOS ECGIngest).
+    Body:
+      { deviceId, ts, samplingHz, voltages: [microvolts...] }
+    """
+    if not _require_api_key(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    body = request.get_json(silent=True) or {}
+    device_id = str(body.get("deviceId", "")).strip()
+    ts = str(body.get("ts", "")).strip()
+    fs = body.get("samplingHz", None)
+    voltages = body.get("voltages", None)
+
+    if not device_id or not ts or not isinstance(fs, (int, float)) or not isinstance(voltages, list):
+        return jsonify({"error": "invalid_body"}), 400
+    if fs <= 0 or fs > 100_000:
+        return jsonify({"error": "invalid_samplingHz"}), 400
+    if len(voltages) < 10 or len(voltages) > 200_000:
+        return jsonify({"error": "invalid_voltages_length"}), 400
+
+    try:
+        arr = np.array(voltages, dtype=float)
+    except Exception:
+        return jsonify({"error": "invalid_voltages"}), 400
+
+    UPLOADED_ECG[device_id] = {
+        "ts": ts,
+        "fs": float(fs),
+        "samples_uV": arr,
+        "received_at": time.time(),
+    }
+    return jsonify({"ok": True})
+
+@app.route("/api/ecg/latest", methods=["GET"])
+def get_latest_ecg():
+    if not _require_api_key(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    device_id = str(request.args.get("deviceId", "")).strip()
+    if not device_id:
+        return jsonify({"error": "missing_deviceId"}), 400
+
+    item = UPLOADED_ECG.get(device_id)
+    if not item:
+        return jsonify({"error": "not_found"}), 404
+
+    sig = item["samples_uV"]
+    fs = item["fs"]
+    samples = _downsample_for_display(sig, target_points=1600)
+    return jsonify(_json_sanitize({
+        "deviceId": device_id,
+        "ts": item.get("ts"),
+        "fs": fs,
+        "samples": samples,
+        "n_original_samples": int(len(sig)),
+        "duration_s": float(len(sig) / fs) if fs else None,
+        "received_at": float(item.get("received_at") or 0),
+    }))
+
+@app.route("/api/waveform", methods=["GET"])
+def waveform():
+    """
+    Unified waveform endpoint for the UI.
+    Query params:
+      - source: demo | daq | upload
+      - deviceId: required when source=upload
+    """
+    source = str(request.args.get("source", "demo"))
+    device_id = request.args.get("deviceId")
+    sig, fs, meta = _get_ecg_source(source, device_id)
+    if sig is None:
+        return jsonify({"error": meta.get("error", "not_found"), "meta": meta}), 404
+
+    samples = _downsample_for_display(sig, target_points=1600)
+    return jsonify(_json_sanitize({
+        "fs": fs,
+        "samples": samples,
+        "n_original_samples": int(len(sig)),
+        "duration_s": float(len(sig) / fs) if fs else None,
+        "meta": meta,
+        "mtime": meta.get("mtime"),
+        "received_at": meta.get("received_at"),
+    }))
+
+@app.route("/api/waveform/live", methods=["GET"])
+def live_waveform():
+    """
+    Returns the most recently saved DAQ waveform (from `daq.py`).
+
+    Response:
+      { "fs": number, "samples": number[], "n_original_samples": number, "duration_s": number, "mtime": number }
+    """
+    live = _load_live_ecg_if_present()
+    if not live:
+        return jsonify({"error": "not_found", "hint": "Run daq.py and press 's' to save data/live_ecg.npz"}), 404
+
+    sig = live["ecg"]
+    fs = live["fs"]
+    samples = _downsample_for_display(sig, target_points=1600)
+    return jsonify(_json_sanitize({
+        "fs": fs,
+        "samples": samples,
+        "n_original_samples": int(len(sig)),
+        "duration_s": float(len(sig) / fs) if fs else None,
+        "mtime": float(live["mtime"]),
+    }))
 
 
 @app.route("/api/mood", methods=["POST"])
@@ -142,7 +359,16 @@ def mood_only():
         "arousal": body.get("arousal", "low"),
         "note": body.get("note", ""),
     }
-    return jsonify(_run_full_pipeline(self_report=self_report))
+    # Respect the same ECG selection as /api/analyze.
+    source = str(request.args.get("source", "demo"))
+    device_id = request.args.get("deviceId")
+    sig, fs, meta = _get_ecg_source(source, device_id)
+    if sig is None:
+        return jsonify({"error": meta.get("error", "not_found"), "meta": meta}), 404
+
+    out = _run_full_pipeline(sig, fs, self_report=self_report)
+    out["meta"] = meta
+    return jsonify(_json_sanitize(out))
 
 
 # Optional: serve the frontend on the same port (avoids CORS entirely)
@@ -175,4 +401,5 @@ if __name__ == "__main__":
     print("    GET  http://localhost:5000/api/analyze")
     print("    POST http://localhost:5000/api/mood")
     print("=" * 60)
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    port = int(os.environ.get("PORT", "5100"))
+    app.run(host="0.0.0.0", port=port, debug=False)

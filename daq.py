@@ -21,6 +21,7 @@ import os
 
 # ============ 配置 ============
 PORT = 'COM9'           # Arduino Uno
+# PORT = '/dev/cu.usbmodem101'
 BAUD = 115200
 FS = 256                # 采样率,要和固件里的一致
 DISPLAY_SEC = 6         # 屏幕显示窗口长度
