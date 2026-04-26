@@ -107,15 +107,44 @@ function applyHeartThemeFromBpm(bpm) {
   stop2.setAttribute("stop-color", col);
 }
 
+/**
+ * @param {string} hex
+ * @returns {{ r: number, g: number, b: number } | null}
+ */
+function parseHexRgb(hex) {
+  const s = String(hex).trim();
+  // Allow "#RRGGBB" or "RRGGBB" from API
+  const m6 = /^#?([0-9a-f]{6})$/i.exec(s);
+  if (m6) {
+    const v = m6[1];
+    return {
+      r: parseInt(v.slice(0, 2), 16),
+      g: parseInt(v.slice(2, 4), 16),
+      b: parseInt(v.slice(4, 6), 16),
+    };
+  }
+  return null;
+}
+
 function setThemeAccent(hex) {
-  // Soft glow alpha chosen to match the original look.
-  document.documentElement.style.setProperty("--accent", hex);
-  document.documentElement.style.setProperty("--accentSoft", `${hex}52`);
+  const h = String(hex).trim();
+  if (!h) return;
+  document.documentElement.style.setProperty("--accent", h);
+  // 8-char #RRGGBBAA is unevenly supported in gradients; use rgba for --accentSoft.
+  const rgb = parseHexRgb(h);
+  if (rgb) {
+    document.documentElement.style.setProperty(
+      "--accentSoft",
+      `rgba(${rgb.r},${rgb.g},${rgb.b},0.32)`
+    );
+  } else {
+    document.documentElement.style.setProperty("--accentSoft", "rgba(255,45,85,0.32)");
+  }
 
   // Update SVG gradient stops to use the accent color (with a little “chrome” variety).
   stop0.setAttribute("stop-color", "#ffffff");
-  stop1.setAttribute("stop-color", hex);
-  stop2.setAttribute("stop-color", hex);
+  stop1.setAttribute("stop-color", h);
+  stop2.setAttribute("stop-color", h);
 }
 
 /** Live mode: use rules-based emotion from `/api/analyze` (HR + HRV + waveform). */
