@@ -1,13 +1,16 @@
 const $ = (id) => /** @type {HTMLElement} */ (document.getElementById(id));
 
-const baseUrlEl = /** @type {HTMLInputElement} */ ($("baseUrl"));
+/** Must match `AppConfig.deviceId` in the iOS ingest app for upload mode. */
+const API_BASE_URL = "https://claudiac-production.up.railway.app";
+const UPLOAD_DEVICE_ID = "ios-001";
+
 const connectBtn = /** @type {HTMLButtonElement} */ ($("connectBtn"));
 const ecgSourceEl = /** @type {HTMLSelectElement} */ ($("ecgSource"));
-const deviceIdEl = /** @type {HTMLInputElement} */ ($("deviceId"));
 
 const bpmValueEl = $("bpmValue");
 const statusTextEl = $("statusText");
 const sourceTextEl = $("sourceText");
+const emotionTextEl = $("emotionText");
 const errorBoxEl = $("errorBox");
 const heartEl = $("heart");
 const glowEl = $("glow");
@@ -78,6 +81,24 @@ function stopAttackMode() {
   attackPhase = false;
 }
 
+/**
+ * Map BPM to a heart accent: cooler / calmer at low rates, warmer at higher rates.
+ * Uses HSL so the gradient always reads clearly on the SVG.
+ */
+function applyHeartThemeFromBpm(bpm) {
+  if (!Number.isFinite(bpm) || bpm <= 0) return;
+  const x = clamp(bpm, 45, 175);
+  // ~240° (blue) at low HR → ~8° (red) at high HR
+  const hue = Math.round(240 - (x - 45) * (232 / 130));
+  const col = `hsl(${hue} 72% 48%)`;
+  const colSoft = `hsl(${hue} 72% 48% / 0.32)`;
+  document.documentElement.style.setProperty("--accent", col);
+  document.documentElement.style.setProperty("--accentSoft", colSoft);
+  stop0.setAttribute("stop-color", "#ffffff");
+  stop1.setAttribute("stop-color", col);
+  stop2.setAttribute("stop-color", col);
+}
+
 function setThemeAccent(hex) {
   // Soft glow alpha chosen to match the original look.
   document.documentElement.style.setProperty("--accent", hex);
@@ -89,18 +110,86 @@ function setThemeAccent(hex) {
   stop2.setAttribute("stop-color", hex);
 }
 
-const EMOTIONS = [
-  { key: "heart-attack", label: "Heart Attack", swatch: "#ff0000", mode: "attack" },
-  { key: "anger", label: "Anger", swatch: "#FF0000" },
-  { key: "anxiety", label: "Anxiety", swatch: "#FF8C00" },
-  { key: "fear", label: "Fear", swatch: "#8A2BE2" },
-  { key: "joy", label: "Joy", swatch: "#FFD700" },
-  { key: "envy", label: "Envy", swatch: "#00CED1" },
-  { key: "disgust", label: "Disgust", swatch: "#32CD32" },
-  { key: "embarrassment", label: "Embarrassment", swatch: "#FF69B4" },
-  { key: "ennui", label: "Ennui", swatch: "#3A3B5C" },
-  { key: "sadness", label: "Sadness", swatch: "#4169E1" },
+/** Live mode: use rules-based emotion from `/api/analyze` (HR + HRV + waveform). */
+function applyEmotionFromServer(emo) {
+  if (!emo || typeof emo !== "object") return;
+  if (emo.attack_mode) {
+    document.documentElement.dataset.demo = "heart-attack";
+    if (!attackTimer) {
+      attackTimer = window.setInterval(() => {
+        attackPhase = !attackPhase;
+        const c = attackPhase ? "#000000" : "#ff0000";
+        stop0.setAttribute("stop-color", c);
+        stop1.setAttribute("stop-color", c);
+        stop2.setAttribute("stop-color", c);
+        document.documentElement.style.setProperty("--accent", "#ff0000");
+        document.documentElement.style.setProperty("--accentSoft", "rgba(255,0,0,0.42)");
+      }, 180);
+    }
+    return;
+  }
+  if (attackTimer) {
+    window.clearInterval(attackTimer);
+    attackTimer = null;
+    attackPhase = false;
+  }
+  const uiKey =
+    typeof emo.ui_key === "string" && emo.ui_key
+      ? emo.ui_key
+      : typeof emo.id === "string"
+        ? emo.id.replace(/_/g, "-")
+        : "";
+  if (uiKey) document.documentElement.dataset.demo = uiKey;
+  if (emo.color) setThemeAccent(emo.color);
+}
+
+/**
+ * Canonical list: `id` = server `emotion.id` from `algorithms/emotion.py` (ECG / iOS ingest).
+ * Labels, colors, and demoBpm follow the same rules table as `EMOTION_STYLES` in Python.
+ */
+const EMOTION_DEFS = {
+  heart_attack: {
+    label: "Heart Attack",
+    swatch: "#ff0000",
+    mode: "attack",
+    demoBpm: 170,
+  },
+  anger: { label: "Anger", swatch: "#FF0000", demoBpm: 96 },
+  anxiety: { label: "Anxiety", swatch: "#FF8C00", demoBpm: 100 },
+  fear: { label: "Fear", swatch: "#8A2BE2", demoBpm: 92 },
+  joy: { label: "Joy", swatch: "#FFD700", demoBpm: 72 },
+  envy: { label: "Envy", swatch: "#00CED1", demoBpm: 75 },
+  disgust: { label: "Disgust", swatch: "#32CD32", demoBpm: 74 },
+  embarrassment: { label: "Embarrassment", swatch: "#FF69B4", demoBpm: 70 },
+  ennui: { label: "Ennui", swatch: "#3A3B5C", demoBpm: 55 },
+  sadness: { label: "Sadness", swatch: "#4169E1", demoBpm: 58 },
+};
+
+const EMOTION_ORDER = [
+  "heart_attack",
+  "anger",
+  "anxiety",
+  "fear",
+  "joy",
+  "envy",
+  "disgust",
+  "embarrassment",
+  "ennui",
+  "sadness",
 ];
+
+const EMOTIONS = EMOTION_ORDER.map((id) => {
+  const d = EMOTION_DEFS[id];
+  if (!d) throw new Error(`Missing EMOTION_DEFS[${id}]`);
+  return {
+    id,
+    key: id === "heart_attack" ? "heart-attack" : id,
+    label: d.label,
+    swatch: d.swatch,
+    mode: d.mode,
+    demoBpm: d.demoBpm,
+  };
+});
 
 function renderDemoButtons() {
   demoButtonsEl.innerHTML = "";
@@ -145,30 +234,27 @@ function applyEmotionDemo(emo) {
       document.documentElement.style.setProperty("--accentSoft", "rgba(255,0,0,0.42)");
     }, 180);
 
-    applyBpm(170, "demo: Heart Attack");
+    applyBpm(
+      typeof emo.demoBpm === "number" && emo.demoBpm > 0 ? emo.demoBpm : 170,
+      "demo: Heart Attack"
+    );
     return;
   }
 
   stopAttackMode();
   document.documentElement.dataset.demo = emo.key;
   setThemeAccent(emo.swatch);
-  applyBpm(72, `demo: ${emo.label}`);
+  const bpm = typeof emo.demoBpm === "number" && emo.demoBpm > 0 ? emo.demoBpm : 72;
+  applyBpm(bpm, `demo: ${emo.label}`);
 }
 
 async function fetchFromClaudiacOnce() {
   // If the user picked a demo, keep it running until they hit Connect.
   if (demoMode) return;
 
-  const baseUrl = baseUrlEl.value.trim().replace(/\/+$/, "");
+  const baseUrl = API_BASE_URL.replace(/\/+$/, "");
   const source = ecgSourceEl.value;
-  const deviceId = deviceIdEl.value.trim();
-  if (!baseUrl) {
-    setStatus("missing config", "warn");
-    setError("Please enter the backend base URL (e.g. http://localhost:5100).");
-    setIdle(true);
-    return;
-  }
-
+  const deviceId = UPLOAD_DEVICE_ID;
   const url = new URL(`${baseUrl}/api/analyze`);
   url.searchParams.set("source", source);
   if (source === "upload") url.searchParams.set("deviceId", deviceId);
@@ -187,11 +273,22 @@ async function fetchFromClaudiacOnce() {
 
     stopAttackMode();
     demoMode = false;
-    setThemeAccent(getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#ff2d55");
 
     setError("");
 
+    const emo = data?.emotion;
+    if (emo?.label) {
+      emotionTextEl.textContent = emo.label;
+    } else {
+      emotionTextEl.textContent = "—";
+    }
+
     if (Number.isFinite(bpm) && bpm > 0) {
+      if (emo?.color) {
+        applyEmotionFromServer(emo);
+      } else {
+        applyHeartThemeFromBpm(bpm);
+      }
       setStatus("connected", "ok");
       applyBpm(bpm, `/api/analyze?source=${source}${source === "upload" ? `&deviceId=${encodeURIComponent(deviceId)}` : ""}`);
       lastBpm = bpm;
@@ -199,9 +296,14 @@ async function fetchFromClaudiacOnce() {
       return;
     }
 
-    // Server may return `null` bpm for very short/weak captures (e.g. early DAQ/iOS window).
+    if (emo?.color) {
+      applyEmotionFromServer(emo);
+    } else {
+      document.documentElement.dataset.demo = "";
+    }
     bpmValueEl.textContent = "—";
     sourceTextEl.textContent = "connected (no bpm yet)";
+    if (!emo?.label) emotionTextEl.textContent = "—";
     setStatus("connected (analyzing…)", "warn");
     setIdle(true);
     lastBpm = null;
@@ -302,10 +404,9 @@ function drawWaveform(samples) {
 
 async function fetchWaveformOnce(force = false) {
   if (demoMode) return;
-  const baseUrl = baseUrlEl.value.trim().replace(/\/+$/, "");
-  if (!baseUrl) return;
+  const baseUrl = API_BASE_URL.replace(/\/+$/, "");
   const source = ecgSourceEl.value;
-  const deviceId = deviceIdEl.value.trim();
+  const deviceId = UPLOAD_DEVICE_ID;
 
   try {
     const waveUrl = new URL(`${baseUrl}/api/waveform`);
@@ -363,20 +464,11 @@ function connect() {
 }
 
 connectBtn.addEventListener("click", connect);
-baseUrlEl.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") connect();
-});
 
 renderDemoButtons();
 connect();
 
 waveRefreshBtn.addEventListener("click", () => void fetchWaveformOnce(true));
 
-for (const el of [ecgSourceEl, deviceIdEl]) {
-  el.addEventListener("change", () => connect());
-}
-
-ecgSourceEl.addEventListener("change", () => {
-  // no-op (kept for future source-specific defaults)
-});
+ecgSourceEl.addEventListener("change", () => connect());
 

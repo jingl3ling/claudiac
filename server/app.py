@@ -37,6 +37,7 @@ sys.path.insert(0, ROOT)
 from algorithms.heart_rate import pan_tompkins
 from algorithms.mood import infer_mood, MOCK_SELF_REPORT, MOCK_CONTEXT
 from algorithms.risk import compute_risk
+from algorithms.emotion import infer_emotion
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +140,7 @@ def _get_ecg_source(source: str, device_id: Optional[str]):
             "deviceId": did,
             "ts": item.get("ts"),
             "received_at": item.get("received_at"),
+            "health_average_bpm": item.get("health_average_bpm"),
         }
 
     if source == "daq":
@@ -197,6 +199,38 @@ def _json_sanitize(value):
     return value
 
 
+def _finalize_upload_health_bpm_if_any(
+    out: dict, meta: dict, source: str, sig: np.ndarray, fs: float
+) -> None:
+    """
+    If iOS sent Health's averageHeartRate, use it for displayed BPM (and mood/risk
+    re-derived from that value). Waveform HR is kept in bpm_from_waveform.
+    Re-infers `emotion` using Health HR with waveform HRV and morphology.
+    Always strips internal _rr_intervals_s from the response payload.
+    """
+    rr = out.pop("_rr_intervals_s", None)
+    if source != "upload" or rr is None:
+        return
+    hb = meta.get("health_average_bpm")
+    if not isinstance(hb, (int, float)):
+        return
+    hbf = float(hb)
+    if not (np.isfinite(hbf) and 20 < hbf < 300):
+        return
+    hrv = out["heart_rate"].get("hrv_sdnn_ms")
+    hrv_f = float(hrv) if hrv is not None and np.isfinite(hrv) else 50.0
+    out["heart_rate"]["bpm_from_waveform"] = out["heart_rate"].get("bpm")
+    out["heart_rate"]["bpm"] = round(hbf, 1)
+    out["mood"] = infer_mood(
+        hbf, hrv_f, self_report=out.get("self_report"), context=out.get("context")
+    )
+    out["risk"] = compute_risk(hbf, hrv_f, rr)
+    pr = pan_tompkins(sig, fs)
+    out["emotion"] = infer_emotion(
+        hbf, hrv_f, sig, fs, pr["r_peaks"], pr["rr_intervals_s"]
+    )
+
+
 def _run_full_pipeline(ecg: np.ndarray,
                        fs: float,
                        self_report: dict = None,
@@ -217,6 +251,21 @@ def _run_full_pipeline(ecg: np.ndarray,
     # R-peak indices need to map onto the downsampled x-axis
     r_peaks_display = (hr_result["r_peaks"] // display_step).tolist()
 
+    wf_bpm = hr_result["heart_rate_bpm"]
+    if not (isinstance(wf_bpm, (int, float, np.floating)) and np.isfinite(wf_bpm)):
+        wf_bpm = 0.0
+    hrv_m = hr_result["hrv_sdnn_ms"]
+    if not (isinstance(hrv_m, (int, float, np.floating)) and np.isfinite(hrv_m)):
+        hrv_m = 0.0
+    emotion = infer_emotion(
+        float(wf_bpm),
+        float(hrv_m),
+        ecg,
+        fs,
+        hr_result["r_peaks"],
+        hr_result["rr_intervals_s"],
+    )
+
     return {
         "ecg": {
             "samples_uV": ecg_display,
@@ -232,9 +281,12 @@ def _run_full_pipeline(ecg: np.ndarray,
             "n_beats": int(len(hr_result["r_peaks"])),
         },
         "mood": mood,
+        "emotion": emotion,
         "risk": risk,
         "self_report": self_report or MOCK_SELF_REPORT,
         "context": context or MOCK_CONTEXT,
+        # Not exposed to clients; used to recompute risk when Health HR overrides bpm.
+        "_rr_intervals_s": hr_result["rr_intervals_s"],
     }
 
 
@@ -262,6 +314,7 @@ def analyze():
         return jsonify({"error": meta.get("error", "not_found"), "meta": meta}), 404
 
     out = _run_full_pipeline(sig, fs)
+    _finalize_upload_health_bpm_if_any(out, meta, source, sig, fs)
     out["meta"] = meta
     return jsonify(_json_sanitize(out))
 
@@ -293,12 +346,18 @@ def upload_ecg():
     except Exception:
         return jsonify({"error": "invalid_voltages"}), 400
 
-    UPLOADED_ECG[device_id] = {
+    entry = {
         "ts": ts,
         "fs": float(fs),
         "samples_uV": arr,
         "received_at": time.time(),
     }
+    hb = body.get("averageHeartRateBpm", body.get("health_average_bpm"))
+    if isinstance(hb, (int, float)):
+        hbf = float(hb)
+        if np.isfinite(hbf) and 20 < hbf < 300:
+            entry["health_average_bpm"] = hbf
+    UPLOADED_ECG[device_id] = entry
     return jsonify({"ok": True})
 
 @app.route("/api/ecg/latest", methods=["GET"])
@@ -396,6 +455,7 @@ def mood_only():
         return jsonify({"error": meta.get("error", "not_found"), "meta": meta}), 404
 
     out = _run_full_pipeline(sig, fs, self_report=self_report)
+    _finalize_upload_health_bpm_if_any(out, meta, source, sig, fs)
     out["meta"] = meta
     return jsonify(_json_sanitize(out))
 

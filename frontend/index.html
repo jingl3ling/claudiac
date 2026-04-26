@@ -20,19 +20,11 @@
 
           <div class="controls">
             <label class="field">
-              <span>Backend</span>
-              <input id="baseUrl" value="http://localhost:5100" autocomplete="off" spellcheck="false" />
-            </label>
-            <label class="field">
               <span>ECG source</span>
               <select id="ecgSource">
                 <option value="demo">Demo ECG</option>
                 <option value="upload">iOS upload (device)</option>
               </select>
-            </label>
-            <label class="field">
-              <span>Device ID</span>
-              <input id="deviceId" value="ios-001" autocomplete="off" spellcheck="false" />
             </label>
             <button id="connectBtn" class="btn" type="button">Connect</button>
           </div>
@@ -128,6 +120,10 @@
               <div class="chip">
                 <span class="chipLabel">Source</span>
                 <span id="sourceText" class="chipValue">—</span>
+              </div>
+              <div class="chip">
+                <span class="chipLabel">Emotion</span>
+                <span id="emotionText" class="chipValue">—</span>
               </div>
             </div>
 
