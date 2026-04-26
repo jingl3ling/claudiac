@@ -1,0 +1,9 @@
+# Nixpacks (Railway) — run from this directory; install deps; start gunicorn
+[phases.setup]
+nixPkgs = ["python312"]
+
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+[start]
+cmd = "gunicorn -w 1 --timeout 120 -b 0.0.0.0:$PORT wsgi:app"

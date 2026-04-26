@@ -22,8 +22,10 @@ or have the frontend fetch from the same URL.
 
 import os
 import sys
+import json
 import math
 import numpy as np
+from typing import Optional
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 import time
@@ -48,13 +50,40 @@ CORS(app)  # allow the frontend to call us from any origin
 # ---------------------------------------------------------------------------
 # Cache: load ECG once at startup, reuse on every request
 # ---------------------------------------------------------------------------
-def _load_ecg():
-    data_path = os.path.join(ROOT, "data", "apple_watch_ecg_api.npz")
-    d = np.load(data_path)
-    return {
-        "voltage_uV": d["voltage_uV"].astype(float),
-        "sampling_rate": float(d["sampling_rate"]),
-    }
+def _load_ecg() -> dict:
+    """
+    Demo ECG for `source=demo`. Prefer compact `.npz`; fall back to JSON in repo
+    (cloud deploys often omit large binaries). Last resort: tiny synthetic signal.
+    """
+    data_dir = os.path.join(ROOT, "data")
+    npz_path = os.path.join(data_dir, "apple_watch_ecg_api.npz")
+    json_path = os.path.join(data_dir, "apple_watch_ecg_api.json")
+
+    if os.path.exists(npz_path):
+        d = np.load(npz_path)
+        return {
+            "voltage_uV": d["voltage_uV"].astype(float),
+            "sampling_rate": float(d["sampling_rate"]),
+        }
+
+    if os.path.exists(json_path):
+        with open(json_path, "r", encoding="utf-8") as f:
+            blob = json.load(f)
+        fs = float(blob["samplingFrequency"]["value"])
+        v = blob["voltageMeasurements"]["voltage_uV"]
+        return {
+            "voltage_uV": np.asarray(v, dtype=float),
+            "sampling_rate": fs,
+        }
+
+    # Minimal fallback so the process still starts (e.g. misconfigured deploy).
+    # Not clinically meaningful — use iOS upload for real ECGs.
+    fs = 256.0
+    n = int(20 * fs)
+    t = np.arange(n) / fs
+    rng = np.random.default_rng(0)
+    sig = 300.0 * np.sin(2 * np.pi * 1.05 * t) + 20.0 * rng.standard_normal(n)
+    return {"voltage_uV": sig.astype(float), "sampling_rate": fs}
 
 
 ECG = _load_ecg()
@@ -91,7 +120,7 @@ def _load_live_ecg_if_present():
     mtime = os.path.getmtime(live_path)
     return {"ecg": ecg, "fs": fs, "mtime": mtime, "path": live_path}
 
-def _get_ecg_source(source: str, device_id: str | None):
+def _get_ecg_source(source: str, device_id: Optional[str]):
     """
     Returns (signal_uV: np.ndarray, fs: float, meta: dict) or (None, None, meta) when missing.
     source: "demo" | "daq" | "upload"

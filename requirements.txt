@@ -1,0 +1,6 @@
+# Claudiac API — use this at repo root for Railway/Render/fly.io
+flask>=3.0.0
+flask-cors>=4.0.0
+gunicorn>=22.0.0
+numpy>=1.26.0
+scipy>=1.11.0
