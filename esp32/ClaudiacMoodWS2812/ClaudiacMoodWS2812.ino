@@ -24,7 +24,7 @@ static const char *WIFI_PASSWORD = "1771-blue-14";
 
 static const char *CLAUDIAC_HOST = "claudiac-production.up.railway.app";
 static const uint16_t CLAUDIAC_HTTPS_PORT = 443;
-static const char *ECG_SOURCE = "demo";
+static const char *ECG_SOURCE = "bridge";
 static const char *DEVICE_ID = "ios-001";
 static const char *API_KEY = "";
 
@@ -57,17 +57,16 @@ static bool isPlaceholderCredentials() {
 }
 
 static void showErrorNoWifiCreds() {
-  // Fast blink: orange = fix SSID/password in this file
-  bool on = (millis() / 400) % 2;
-  fill_solid(leds, NUM_LEDS, on ? CRGB(255, 100, 0) : CRGB(20, 10, 0));
+  // Default to yellow when WiFi isn't configured.
+  fill_solid(leds, NUM_LEDS, CRGB(255, 215, 0));
   FastLED.setBrightness(120);
   FastLED.show();
 }
 
 static void showWifiConnectAttempt() {
-  // Slow pulse blue while connecting
-  uint8_t p = 40 + (uint8_t)(20 * (1.0f + sinf(millis() * 0.004f)) * 0.5f);
-  fill_solid(leds, NUM_LEDS, CRGB(0, p / 2, p));
+  // Default to yellow when WiFi is down/connecting.
+  uint8_t p = 80 + (uint8_t)(60 * (1.0f + sinf(millis() * 0.004f)) * 0.5f);
+  fill_solid(leds, NUM_LEDS, CRGB(p, (uint8_t)(p * 0.84f), 0));
   FastLED.show();
 }
 

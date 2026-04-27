@@ -43,9 +43,9 @@
             >
               <defs>
                 <linearGradient id="hgFill" x1="0" y1="0" x2="1" y2="1">
-                  <stop id="hgStop0" offset="0" stop-color="#ff9ad1" />
-                  <stop id="hgStop1" offset="0.45" stop-color="#ff2d55" />
-                  <stop id="hgStop2" offset="1" stop-color="#ff2d55" />
+                  <stop id="hgStop0" offset="0" stop-color="#fff1a6" />
+                  <stop id="hgStop1" offset="0.45" stop-color="#FFD700" />
+                  <stop id="hgStop2" offset="1" stop-color="#FFD700" />
                 </linearGradient>
                 <linearGradient id="hgChrome" x1="0" y1="0" x2="1" y2="0">
                   <stop offset="0" stop-color="rgba(255,255,255,0.95)" />
@@ -109,10 +109,6 @@
                 <span id="statusText" class="chipValue">disconnected</span>
               </div>
               <div class="chip">
-                <span class="chipLabel">Source</span>
-                <span id="sourceText" class="chipValue">—</span>
-              </div>
-              <div class="chip">
                 <span class="chipLabel">Emotion</span>
                 <span id="emotionText" class="chipValue">—</span>
               </div>
@@ -121,24 +117,6 @@
             <div class="demo">
               <div class="demoTitle">Emotion demos</div>
               <div id="demoButtons" class="demoGrid" aria-label="Emotion demo buttons"></div>
-              <div class="demoHint">These buttons only change the UI colors/effects.</div>
-            </div>
-
-            <div class="wave">
-              <div class="waveTop">
-                <div class="waveTitle">DAQ waveform</div>
-                <button id="waveRefreshBtn" class="btn btnSmall" type="button">Refresh</button>
-              </div>
-              <canvas id="waveCanvas" width="760" height="170" aria-label="ECG waveform"></canvas>
-              <div class="waveMeta">
-                <span class="chipLabel">Source</span>
-                <span id="waveSourceText" class="chipValue">/api/waveform/live</span>
-                <span class="chipLabel">•</span>
-                <span id="waveInfoText" class="chipValue">—</span>
-              </div>
-              <div class="demoHint">
-                Run <code>daq.py</code> and press <code>s</code> to save <code>data/live_ecg.npz</code>, then refresh.
-              </div>
             </div>
 
             <div id="errorBox" class="error" hidden></div>

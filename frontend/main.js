@@ -9,15 +9,11 @@ const ecgSourceEl = /** @type {HTMLSelectElement} */ ($("ecgSource"));
 
 const bpmValueEl = $("bpmValue");
 const statusTextEl = $("statusText");
-const sourceTextEl = $("sourceText");
 const emotionTextEl = $("emotionText");
 const errorBoxEl = $("errorBox");
 const heartEl = $("heart");
 const glowEl = $("glow");
 const demoButtonsEl = $("demoButtons");
-const waveCanvas = /** @type {HTMLCanvasElement} */ ($("waveCanvas"));
-const waveRefreshBtn = /** @type {HTMLButtonElement} */ ($("waveRefreshBtn"));
-const waveInfoTextEl = $("waveInfoText");
 
 const stop0 = /** @type {SVGStopElement} */ (document.getElementById("hgStop0"));
 const stop1 = /** @type {SVGStopElement} */ (document.getElementById("hgStop1"));
@@ -27,22 +23,46 @@ let timer = null;
 let lastBpm = null;
 let demoMode = false;
 
-let waveTimer = null;
-let lastWaveMtime = 0;
-
 let attackTimer = null;
 let attackPhase = false;
 
 const STALE_AFTER_MS = 4000;
 let lastGoodAt = 0;
 
-// Scrolling ECG (time-correct: matches recording duration, demo vs upload)
-const WINDOW_S = 2.0;
-let fullSamples = [];
-let displaySampleRate = 256;
-let playheadStartedAt = 0;
-/** @type {number | null} */
-let scopeRafId = null;
+const DEMO_PERSIST_KEY = "claudiac.demoEmotion";
+const DEMO_PERSIST_TTL_MS = 1000 * 60 * 60 * 24 * 30; // 30 days
+
+function persistDemoEmotionId(id) {
+  try {
+    localStorage.setItem(DEMO_PERSIST_KEY, JSON.stringify({ id, at: Date.now() }));
+  } catch {
+    // ignore
+  }
+}
+
+function readPersistedDemoEmotionId() {
+  try {
+    const raw = localStorage.getItem(DEMO_PERSIST_KEY);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    if (!obj || typeof obj.id !== "string") return null;
+    const at = typeof obj.at === "number" ? obj.at : 0;
+    if (at && Date.now() - at > DEMO_PERSIST_TTL_MS) return null;
+    // Don’t auto-restore Heart Attack on refresh (default should be yellow).
+    if (obj.id === "heart_attack") return null;
+    return obj.id;
+  } catch {
+    return null;
+  }
+}
+
+function clearPersistedDemoEmotion() {
+  try {
+    localStorage.removeItem(DEMO_PERSIST_KEY);
+  } catch {
+    // ignore
+  }
+}
 
 function setError(message) {
   if (!message) {
@@ -75,9 +95,8 @@ function bpmToBeatSeconds(bpm) {
   return clamp(seconds, 0.33, 1.6);
 }
 
-function applyBpm(bpm, sourceLabel) {
+function applyBpm(bpm) {
   bpmValueEl.textContent = String(Math.round(bpm));
-  sourceTextEl.textContent = sourceLabel || "—";
   document.documentElement.style.setProperty("--beat", `${bpmToBeatSeconds(bpm)}s`);
   setIdle(false);
 }
@@ -250,138 +269,6 @@ const EMOTIONS = EMOTION_ORDER.map((id) => {
   };
 });
 
-function stopScopeAnimation() {
-  if (scopeRafId !== null) cancelAnimationFrame(scopeRafId);
-  scopeRafId = null;
-}
-
-function startScopeAnimation() {
-  if (scopeRafId !== null) return;
-  playheadStartedAt = performance.now();
-  const tick = (now) => {
-    drawScrollingScope(now);
-    scopeRafId = requestAnimationFrame(tick);
-  };
-  scopeRafId = requestAnimationFrame(tick);
-}
-
-function drawScrollingScope(nowMs) {
-  const ctx = waveCanvas.getContext("2d");
-  if (!ctx) return;
-  const dpr = window.devicePixelRatio || 1;
-  const rect = waveCanvas.getBoundingClientRect();
-  const w = Math.max(1, Math.floor(rect.width * dpr));
-  const h = Math.max(1, Math.floor(rect.height * dpr));
-  if (waveCanvas.width !== w) waveCanvas.width = w;
-  if (waveCanvas.height !== h) waveCanvas.height = h;
-
-  ctx.clearRect(0, 0, w, h);
-  ctx.globalAlpha = 1;
-  ctx.strokeStyle = "rgba(255,255,255,0.08)";
-  ctx.lineWidth = 1;
-  for (let i = 1; i < 10; i++) {
-    const x = Math.round((w * i) / 10) + 0.5;
-    ctx.beginPath();
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, h);
-    ctx.stroke();
-  }
-  for (let i = 1; i < 6; i++) {
-    const y = Math.round((h * i) / 6) + 0.5;
-    ctx.beginPath();
-    ctx.moveTo(0, y);
-    ctx.lineTo(w, y);
-    ctx.stroke();
-  }
-  if (!fullSamples.length) return;
-
-  const totalSeconds = fullSamples.length / displaySampleRate;
-  const elapsedMs = nowMs - playheadStartedAt;
-  const elapsedS = (elapsedMs / 1000) % Math.max(totalSeconds, 0.001);
-  const playheadIdx = Math.floor(elapsedS * displaySampleRate);
-
-  const windowSamples = Math.max(2, Math.floor(WINDOW_S * displaySampleRate));
-  const startIdx = playheadIdx - windowSamples;
-
-  const visible = new Array(windowSamples);
-  for (let i = 0; i < windowSamples; i++) {
-    let idx = startIdx + i;
-    while (idx < 0) idx += fullSamples.length;
-    while (idx >= fullSamples.length) idx -= fullSamples.length;
-    visible[i] = fullSamples[idx];
-  }
-
-  let minV = Infinity;
-  let maxV = -Infinity;
-  for (const v of visible) {
-    if (v < minV) minV = v;
-    if (v > maxV) maxV = v;
-  }
-  if (!Number.isFinite(minV) || !Number.isFinite(maxV)) {
-    minV = -1;
-    maxV = 1;
-  }
-  const span = Math.max(maxV - minV, 200);
-  const center = (maxV + minV) / 2;
-  minV = center - span / 2;
-  maxV = center + span / 2;
-  const pad = (maxV - minV) * 0.1;
-  minV -= pad;
-  maxV += pad;
-
-  const accent =
-    getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#ff2d55";
-  ctx.strokeStyle = accent;
-  ctx.lineWidth = Math.max(1.5, Math.round(1.8 * dpr));
-  ctx.lineJoin = "round";
-  ctx.lineCap = "round";
-
-  const n = visible.length;
-  const xScale = (w - 2) / Math.max(1, n - 1);
-  const yScale = (h - 2) / (maxV - minV);
-  ctx.beginPath();
-  for (let i = 0; i < n; i++) {
-    const x = 1 + i * xScale;
-    const y = 1 + (maxV - visible[i]) * yScale;
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  }
-  ctx.stroke();
-}
-
-/**
- * @param {Record<string, unknown>} ecgPayload — shape from /api/analyze `ecg` or /api/waveform
- */
-function adoptWaveformFromEcgPayload(ecgPayload) {
-  const samples = ecgPayload?.samples_uV;
-  if (!Array.isArray(samples) || !samples.length) {
-    fullSamples = [];
-    stopScopeAnimation();
-    return;
-  }
-  const fs = Number(ecgPayload.sampling_rate);
-  const step = Number(ecgPayload.display_step) || 1;
-  const dur = Number(ecgPayload.duration_s);
-  const n0 = Number(ecgPayload.n_original_samples);
-  const n = samples.length;
-
-  fullSamples = /** @type {number[]} */ (samples);
-  if (Number.isFinite(dur) && dur > 0 && n > 0) {
-    displaySampleRate = n / dur;
-  } else {
-    const fs0 = Number.isFinite(fs) && fs > 0 ? fs : 256;
-    displaySampleRate = fs0 / (step > 0 ? step : 1);
-  }
-
-  playheadStartedAt = performance.now();
-  waveInfoTextEl.textContent =
-    `${Number.isFinite(dur) ? dur.toFixed(1) : "—"}s @ ${Number.isFinite(fs) ? fs.toFixed(0) : "—"}Hz` +
-    (Number.isFinite(n0) ? ` • ${n0} samples` : "") +
-    ` • scope ${WINDOW_S}s`;
-
-  startScopeAnimation();
-}
-
 function renderDemoButtons() {
   demoButtonsEl.innerHTML = "";
   for (const emo of EMOTIONS) {
@@ -402,17 +289,17 @@ function applyEmotionDemo(emo) {
   // Otherwise the polling loop will immediately overwrite the theme.
   if (timer) window.clearInterval(timer);
   timer = null;
-  if (waveTimer) window.clearInterval(waveTimer);
-  waveTimer = null;
-  stopScopeAnimation();
-  fullSamples = [];
 
   demoMode = true;
   lastBpm = null;
   lastGoodAt = 0;
   setError("");
   setStatus("demo (emotion)", "warn");
-  if (emo?.id) void bridgeSetEmotionId(emo.id);
+  if (emo?.id) {
+    persistDemoEmotionId(emo.id);
+    void bridgeSetEmotionId(emo.id);
+  }
+  emotionTextEl.textContent = emo?.label ? String(emo.label) : "—";
 
   if (emo.mode === "attack") {
     stopAttackMode();
@@ -428,10 +315,7 @@ function applyEmotionDemo(emo) {
       document.documentElement.style.setProperty("--accentSoft", "rgba(255,0,0,0.42)");
     }, 180);
 
-    applyBpm(
-      typeof emo.demoBpm === "number" && emo.demoBpm > 0 ? emo.demoBpm : 170,
-      "demo: Heart Attack"
-    );
+    applyBpm(typeof emo.demoBpm === "number" && emo.demoBpm > 0 ? emo.demoBpm : 170);
     return;
   }
 
@@ -439,7 +323,7 @@ function applyEmotionDemo(emo) {
   document.documentElement.dataset.demo = emo.key;
   setThemeAccent(emo.swatch);
   const bpm = typeof emo.demoBpm === "number" && emo.demoBpm > 0 ? emo.demoBpm : 72;
-  applyBpm(bpm, `demo: ${emo.label}`);
+  applyBpm(bpm);
 }
 
 async function fetchFromClaudiacOnce() {
@@ -483,11 +367,8 @@ async function fetchFromClaudiacOnce() {
       } else {
         applyHeartThemeFromBpm(bpm);
       }
-      if (data?.ecg) {
-        adoptWaveformFromEcgPayload(/** @type {Record<string, unknown>} */ (data.ecg));
-      }
       setStatus("connected", "ok");
-      applyBpm(bpm, `/api/analyze?source=${source}${source === "upload" ? `&deviceId=${encodeURIComponent(deviceId)}` : ""}`);
+      applyBpm(bpm);
       lastBpm = bpm;
       lastGoodAt = Date.now();
       return;
@@ -498,11 +379,7 @@ async function fetchFromClaudiacOnce() {
     } else {
       document.documentElement.dataset.demo = "";
     }
-    if (data?.ecg) {
-      adoptWaveformFromEcgPayload(/** @type {Record<string, unknown>} */ (data.ecg));
-    }
     bpmValueEl.textContent = "—";
-    sourceTextEl.textContent = "connected (no bpm yet)";
     if (!emo?.label) emotionTextEl.textContent = "—";
     setStatus("connected (analyzing…)", "warn");
     setIdle(true);
@@ -518,7 +395,6 @@ async function fetchFromClaudiacOnce() {
 
     if (isStale && typeof lastBpm !== "number") {
       setIdle(true);
-      sourceTextEl.textContent = "—";
       return;
     }
 
@@ -531,51 +407,13 @@ async function fetchFromClaudiacOnce() {
   }
 }
 
-async function fetchWaveformOnce(force = false) {
-  if (demoMode) return;
-  const baseUrl = API_BASE_URL.replace(/\/+$/, "");
-  const source = ecgSourceEl.value;
-  const deviceId = UPLOAD_DEVICE_ID;
-
-  try {
-    const waveUrl = new URL(`${baseUrl}/api/waveform`);
-    waveUrl.searchParams.set("source", source);
-    if (source === "upload") waveUrl.searchParams.set("deviceId", deviceId);
-
-    const res = await fetch(waveUrl.toString(), { cache: "no-store" });
-    if (!res.ok) {
-      if (res.status === 404) {
-        waveInfoTextEl.textContent = "no live capture yet";
-        fullSamples = [];
-        return;
-      }
-      throw new Error(`${res.status} ${res.statusText}`);
-    }
-
-    const data = await res.json();
-    const mtime = Number(data?.mtime ?? 0);
-    if (!force && mtime && mtime === lastWaveMtime) return;
-    lastWaveMtime = mtime || lastWaveMtime;
-
-    adoptWaveformFromEcgPayload({
-      samples_uV: data?.samples,
-      sampling_rate: data?.fs,
-      display_step: data?.display_step,
-      duration_s: data?.duration_s,
-      n_original_samples: data?.n_original_samples,
-    });
-  } catch {
-    waveInfoTextEl.textContent = "waveform unavailable";
-  }
-}
-
 function connect() {
   if (timer) window.clearInterval(timer);
   timer = null;
 
   demoMode = false;
   stopAttackMode();
-  stopScopeAnimation();
+  clearPersistedDemoEmotion();
   void bridgeClearEmotion();
 
   setStatus("connecting…", "muted");
@@ -583,22 +421,23 @@ function connect() {
   setIdle(true);
   lastGoodAt = 0;
   lastBpm = null;
+  emotionTextEl.textContent = "—";
+  bpmValueEl.textContent = "—";
 
   // Fetch immediately, then poll.
   void fetchFromClaudiacOnce();
   timer = window.setInterval(fetchFromClaudiacOnce, 1200);
-
-  void fetchWaveformOnce(true);
-  if (waveTimer) window.clearInterval(waveTimer);
-  waveTimer = window.setInterval(fetchWaveformOnce, 1500);
 }
 
 connectBtn.addEventListener("click", connect);
 
 renderDemoButtons();
-connect();
-
-waveRefreshBtn.addEventListener("click", () => void fetchWaveformOnce(true));
+{
+  const persisted = readPersistedDemoEmotionId();
+  const emo = persisted ? EMOTIONS.find((e) => e.id === persisted) : null;
+  if (emo) applyEmotionDemo(emo);
+  else connect();
+}
 
 ecgSourceEl.addEventListener("change", () => connect());
 
