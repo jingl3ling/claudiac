@@ -147,6 +147,28 @@ function setThemeAccent(hex) {
   stop2.setAttribute("stop-color", h);
 }
 
+async function bridgeSetEmotionId(id) {
+  const baseUrl = API_BASE_URL.replace(/\/+$/, "");
+  try {
+    await fetch(`${baseUrl}/api/bridge/emotion`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+  } catch {
+    // Bridge is best-effort (don’t block UI if backend is offline).
+  }
+}
+
+async function bridgeClearEmotion() {
+  const baseUrl = API_BASE_URL.replace(/\/+$/, "");
+  try {
+    await fetch(`${baseUrl}/api/bridge/emotion`, { method: "DELETE" });
+  } catch {
+    // ignore
+  }
+}
+
 /** Live mode: use rules-based emotion from `/api/analyze` (HR + HRV + waveform). */
 function applyEmotionFromServer(emo) {
   if (!emo || typeof emo !== "object") return;
@@ -390,6 +412,7 @@ function applyEmotionDemo(emo) {
   lastGoodAt = 0;
   setError("");
   setStatus("demo (emotion)", "warn");
+  if (emo?.id) void bridgeSetEmotionId(emo.id);
 
   if (emo.mode === "attack") {
     stopAttackMode();
@@ -553,6 +576,7 @@ function connect() {
   demoMode = false;
   stopAttackMode();
   stopScopeAnimation();
+  void bridgeClearEmotion();
 
   setStatus("connecting…", "muted");
   setError("");

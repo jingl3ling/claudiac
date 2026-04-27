@@ -37,7 +37,7 @@ sys.path.insert(0, ROOT)
 from algorithms.heart_rate import pan_tompkins
 from algorithms.mood import infer_mood, MOCK_SELF_REPORT, MOCK_CONTEXT
 from algorithms.risk import compute_risk
-from algorithms.emotion import infer_emotion
+from algorithms.emotion import EMOTION_STYLES, EMOTION_UI_KEY, infer_emotion
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +100,27 @@ def _require_api_key(req) -> bool:
 # Latest uploaded ECGs (e.g. from iOS ECGIngest). Stored in-memory.
 # Shape: { deviceId: { "ts": str, "fs": float, "samples_uV": np.ndarray, "received_at": float } }
 UPLOADED_ECG = {}
+
+# UI -> Arduino bridge state (in-memory).
+# Shape: { "emotion": <emotion dict>, "set_at": float }
+BRIDGE_STATE = {"emotion": None, "set_at": 0.0}
+
+def _pack_emotion_from_id(eid: str) -> dict:
+    eid = str(eid or "").strip()
+    if not eid:
+        raise ValueError("missing_id")
+    st = EMOTION_STYLES.get(eid)
+    if not st:
+        raise ValueError("unknown_id")
+    return {
+        "id": eid,
+        "ui_key": EMOTION_UI_KEY.get(eid, eid.replace("_", "-")),
+        "label": st.get("label", eid),
+        "color": st.get("color", "#8e8e93"),
+        "attack_mode": bool(st.get("attack_mode", False)),
+        "reason": "UI override (bridge)",
+        "inputs": {"source": "bridge"},
+    }
 
 def _load_live_ecg_if_present():
     """
@@ -324,11 +345,20 @@ def analyze():
 def led_state():
     """
     Small JSON for microcontrollers (no ECG array). Same query as /api/analyze:
-      source: demo | daq | upload
+      source: demo | daq | upload | bridge
       deviceId: required when source=upload
     """
     source = str(request.args.get("source", "demo"))
     device_id = request.args.get("deviceId")
+    if source.strip().lower() == "bridge":
+        emo = BRIDGE_STATE.get("emotion")
+        if not emo:
+            return jsonify({"error": "bridge_unset", "meta": {"source": "bridge"}}), 404
+        return jsonify(_json_sanitize({
+            "heart_rate": None,
+            "emotion": emo,
+            "meta": {"source": "bridge", "set_at": BRIDGE_STATE.get("set_at", 0.0)},
+        }))
     sig, fs, meta = _get_ecg_source(source, device_id)
     if sig is None:
         return jsonify({"error": meta.get("error", "not_found"), "meta": meta}), 404
@@ -341,6 +371,41 @@ def led_state():
         "meta": meta,
     }
     return jsonify(_json_sanitize(brief))
+
+@app.route("/api/bridge/emotion", methods=["GET", "POST", "DELETE"])
+def bridge_emotion():
+    """
+    UI -> Arduino bridge.
+      - GET: return current bridge emotion (or 404 if unset)
+      - POST: set bridge emotion by id (e.g. {"id":"anger"})
+      - DELETE: clear bridge
+    """
+    if request.method in ("POST", "DELETE") and not _require_api_key(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    if request.method == "GET":
+        emo = BRIDGE_STATE.get("emotion")
+        if not emo:
+            return jsonify({"error": "bridge_unset", "meta": {"source": "bridge"}}), 404
+        return jsonify(_json_sanitize({
+            "emotion": emo,
+            "meta": {"source": "bridge", "set_at": BRIDGE_STATE.get("set_at", 0.0)},
+        }))
+
+    if request.method == "DELETE":
+        BRIDGE_STATE["emotion"] = None
+        BRIDGE_STATE["set_at"] = 0.0
+        return jsonify({"ok": True})
+
+    body = request.get_json(silent=True) or {}
+    eid = body.get("id", "")
+    try:
+        emo = _pack_emotion_from_id(eid)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    BRIDGE_STATE["emotion"] = emo
+    BRIDGE_STATE["set_at"] = float(time.time())
+    return jsonify(_json_sanitize({"ok": True, "emotion": emo}))
 
 
 @app.route("/api/ecg", methods=["POST"])

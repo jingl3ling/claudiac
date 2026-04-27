@@ -1,15 +1,13 @@
 /**
- * Claudiac — ESP32 + WS2812B strip (8 LEDs) driven by server mood/emotion color.
+ * Claudiac — ESP32 + WS2812B strip (8 LEDs) from GET /api/led (emotion.color).
  *
- * Server: use GET /api/led (small JSON) — same `source` / `deviceId` as /api/analyze.
- *
- * Arduino IDE 2.x + esp32 by Espressif
- * Library Manager: install "FastLED" by Daniel Garcia, "ArduinoJson" by Benoit Blanchon
- *
- * Wiring: DI of first LED to GPIO 13, 5V + GND (use level shifter 3.3V→5V for long strips;
- *         8 pixels often work at 3.3V on short wire — YMMV.)
+ * If colors never change: set WIFI_SSID / WIFI_PASSWORD below (not CHANGE_ME),
+ * open Serial 115200, and read the log (WiFi + HTTP + parsed RGB).
  */
 
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
@@ -17,137 +15,255 @@
 #include <ArduinoJson.h>
 #include <FastLED.h>
 
-// ---------------- config ----------------
-static const char *WIFI_SSID = "jh828";
-static const char *WIFI_PASSWORD = "Lisongying9";
+#define CLAUDIAC_DEBUG 1
+#define STRIP_SELF_TEST 0
 
-// Set to your Claudiac base (no trailing slash). Examples:
-//   "https://claudiac-production.up.railway.app"
-//   "http://192.168.1.42:5100"
-static const char *CLAUDIAC_BASE = "https://claudiac-production.up.railway.app";
+// --- WiFi: MUST set your real network (CHANGE_ME = stuck / no data from server) ---
+static const char *WIFI_SSID = "MyOptimum 62d365";
+static const char *WIFI_PASSWORD = "1771-blue-14";
 
-// Match web UI / iOS: demo | upload | daq
+static const char *CLAUDIAC_HOST = "claudiac-production.up.railway.app";
+static const uint16_t CLAUDIAC_HTTPS_PORT = 443;
 static const char *ECG_SOURCE = "demo";
-// If source=upload, must match ECGIngest deviceId
 static const char *DEVICE_ID = "ios-001";
-
-// Optional: set in Railway (or .env) on server; leave empty if unused
 static const char *API_KEY = "";
 
-// WS2812B
 static const int LED_PIN = 13;
 static const int NUM_LEDS = 8;
-static const uint8_t BRIGHTNESS = 120;  // 0-255
+static const uint8_t BRIGHTNESS = 120;
+static const unsigned long POLL_MS = 3000;
+static const unsigned long WIFI_TIMEOUT_MS = 30000;
+static const unsigned long WIFI_RETRY_MS = 10000;
 
-static const unsigned long POLL_MS = 2000;  // avoid hammering the API
+static CRGB leds[NUM_LEDS];
+static unsigned long lastFetch = 0;
+static unsigned long lastWifiAttempt = 0;
+static bool g_attackMode = false;
+static CRGB g_solid(20, 20, 30);
+static bool g_wifiUp = false;
+static bool g_configOk = true;
+static bool g_lastFetchOk = false;
+static bool g_hasLastSolid = false;
+static CRGB g_lastSolid(0, 0, 0);
 
-// ---------------- state ----------------
-CRGB leds[NUM_LEDS];
-unsigned long lastFetch = 0;
+#if STRIP_SELF_TEST
+static uint32_t selfTestLast = 0;
+static uint8_t selfTestHue = 0;
+#endif
 
-bool g_attackMode = false;
-CRGB g_solid(40, 40, 40);  // default idle / unknown
-
-bool isHttps(const char *url) {
-  return strncmp(url, "https://", 8) == 0;
+static bool isPlaceholderCredentials() {
+  return (WIFI_SSID[0] == '\0' || strcmp(WIFI_SSID, "CHANGE_ME") == 0 ||
+          strcmp(WIFI_PASSWORD, "CHANGE_ME") == 0);
 }
 
-void connectWifi() {
+static void showErrorNoWifiCreds() {
+  // Fast blink: orange = fix SSID/password in this file
+  bool on = (millis() / 400) % 2;
+  fill_solid(leds, NUM_LEDS, on ? CRGB(255, 100, 0) : CRGB(20, 10, 0));
+  FastLED.setBrightness(120);
+  FastLED.show();
+}
+
+static void showWifiConnectAttempt() {
+  // Slow pulse blue while connecting
+  uint8_t p = 40 + (uint8_t)(20 * (1.0f + sinf(millis() * 0.004f)) * 0.5f);
+  fill_solid(leds, NUM_LEDS, CRGB(0, p / 2, p));
+  FastLED.show();
+}
+
+static void showHttpFailPattern() {
+  // Short blink red: got WiFi but /api/led failed (see Serial)
+  static uint32_t t = 0;
+  if (millis() - t < 200) return;
+  t = millis();
+  static bool b;
+  b = !b;
+  fill_solid(leds, NUM_LEDS, b ? CRGB(80, 0, 0) : g_solid);
+  FastLED.show();
+}
+
+static bool tryConnectWifi() {
+  if (isPlaceholderCredentials()) {
+    g_configOk = false;
+    g_wifiUp = false;
+    Serial.println(F("Set WIFI_SSID and WIFI_PASSWORD in this .ino (not CHANGE_ME)."));
+    return false;
+  }
+  g_configOk = true;
   WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);
+  delay(100);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("WiFi");
+  Serial.print(F("WiFi: "));
+  Serial.print(WIFI_SSID);
+
+  uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED) {
-    delay(400);
+    if (millis() - start > WIFI_TIMEOUT_MS) {
+      Serial.println(F(" — TIMEOUT (check SSID/password)"));
+      g_wifiUp = false;
+      return false;
+    }
+    delay(300);
     Serial.print(".");
   }
   Serial.println();
-  Serial.print("IP: ");
+  Serial.print(F("IP: "));
   Serial.println(WiFi.localIP());
+  g_wifiUp = true;
+  return true;
 }
 
-// Parse #RRGGBB (Claudiac returns 6-digit hex) into FastLED
-bool parseColorHex(const char *s, CRGB &out) {
-  if (!s || s[0] != '#' || strlen(s) != 7) return false;
+static bool parseColorHex(const char *s, CRGB &out) {
+  if (!s) return false;
+  while (*s == ' ' || *s == '\t') s++;
+  if (*s == '#') s++;
+  if (strlen(s) != 6) return false;
+  for (int i = 0; i < 6; i++) {
+    if (!isxdigit((unsigned char)s[i])) return false;
+  }
   char *end = nullptr;
-  unsigned long v = strtoul(s + 1, &end, 16);
-  if (end != s + 7) return false;
+  unsigned long v = strtoul(s, &end, 16);
+  if (end != s + 6 || v > 0xFFFFFF) return false;
   out = CRGB((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
   return true;
 }
 
-void buildPath(char *buf, size_t cap) {
-  // /api/led?source=demo&deviceId=ios-001
-  if (strcmp(ECG_SOURCE, "upload") == 0) {
+static bool setSolidIfChanged(const CRGB &next) {
+  if (!g_hasLastSolid) {
+    g_hasLastSolid = true;
+    g_lastSolid = next;
+    g_solid = next;
+    return true;
+  }
+  if (g_lastSolid == next) return false;
+  g_lastSolid = next;
+  g_solid = next;
+  return true;
+}
+
+static void buildPath(char *buf, size_t cap) {
+  if (strcmp(ECG_SOURCE, "bridge") == 0) {
+    snprintf(buf, cap, "/api/led?source=bridge");
+  } else if (strcmp(ECG_SOURCE, "upload") == 0) {
     snprintf(buf, cap, "/api/led?source=upload&deviceId=%s", DEVICE_ID);
   } else {
     snprintf(buf, cap, "/api/led?source=%s", ECG_SOURCE);
   }
 }
 
-bool fetchEmotion() {
-  char path[120];
+/**
+ * Use host + port + path (TLS) — more reliable on ESP32 than begin(client, fullUrlString).
+ */
+static bool fetchEmotion() {
+  if (!g_wifiUp) return false;
+
+  char path[128];
   buildPath(path, sizeof(path));
-  const String url = String(CLAUDIAC_BASE) + String(path);
+
+#if CLAUDIAC_DEBUG
+  Serial.print(F("GET https://"));
+  Serial.print(CLAUDIAC_HOST);
+  Serial.println(path);
+#endif
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(15000);
 
   HTTPClient http;
-  if (isHttps(CLAUDIAC_BASE)) {
-    WiFiClientSecure s;
-    s.setInsecure();
-    s.setTimeout(12000);
-    if (!http.begin(s, url)) {
-      Serial.println("http.begin (https) failed");
-      return false;
-    }
-  } else {
-    WiFiClient c;
-    c.setTimeout(12000);
-    if (!http.begin(c, url)) {
-      Serial.println("http.begin (http) failed");
-      return false;
-    }
+  // bool begin(WiFiClient &client, const char *host, uint16_t port, const char *path, bool https)
+  if (!http.begin(client, CLAUDIAC_HOST, CLAUDIAC_HTTPS_PORT, path, true)) {
+    Serial.println(F("http.begin failed"));
+    g_lastFetchOk = false;
+    return false;
   }
   if (API_KEY[0] != '\0') {
     http.addHeader("x-api-key", API_KEY);
   }
   int code = http.GET();
-  if (code != 200) {
-    Serial.print("GET ");
-    Serial.print(path);
-    Serial.print(" -> ");
-    Serial.println(code);
-    http.end();
-    return false;
-  }
   String body = http.getString();
   http.end();
+#if CLAUDIAC_DEBUG
+  Serial.print(F("HTTP "));
+  Serial.print(code);
+  Serial.print(F(" body len="));
+  Serial.println(body.length());
+#endif
 
-  StaticJsonDocument<1024> doc;
+  if (code != 200) {
+    if (code > 0) {
+      Serial.println(body.substring(0, min(200, (int)body.length())));
+    }
+    g_lastFetchOk = false;
+    return false;
+  }
+
+  StaticJsonDocument<2048> doc;
   if (deserializeJson(doc, body)) {
-    Serial.println("JSON parse error");
+    Serial.println(F("JSON parse error"));
+    g_lastFetchOk = false;
     return false;
   }
 
   JsonObject emo = doc["emotion"].as<JsonObject>();
   if (!emo) {
-    Serial.println("no emotion in response");
-    g_attackMode = false;
-    return true;
+    Serial.println(F("No 'emotion' object in JSON"));
+    g_lastFetchOk = false;
+    return false;
   }
 
-  g_attackMode = emo["attack_mode"] | false;
-  const char *col = emo["color"] | "#505050";
-  if (!parseColorHex(col, g_solid)) {
-    g_solid = CRGB(50, 50, 55);
+  g_attackMode = (bool)emo["attack_mode"];
+  if (!emo.containsKey("color")) {
+    Serial.println(F("No 'color' in emotion"));
+    g_lastFetchOk = false;
+    return false;
   }
 
-  if (const char *id = emo["id"] | nullptr) {
-    Serial.print("emotion: ");
-    Serial.println(id);
+  const char *col = emo["color"].as<const char *>();
+  if (!col) {
+    Serial.println(F("emotion.color is null"));
+    g_lastFetchOk = false;
+    return false;
   }
+
+  char colorBuf[24];
+  snprintf(colorBuf, sizeof(colorBuf), "%s", col);
+
+#if CLAUDIAC_DEBUG
+  if (const char *eid = emo["id"].as<const char *>()) {
+    Serial.print(F("id="));
+    Serial.print(eid);
+    Serial.print(F(" color="));
+  }
+  Serial.println(colorBuf);
+#endif
+
+  CRGB nextColor;
+  if (!parseColorHex(colorBuf, nextColor)) {
+    Serial.println(F("parseColorHex failed"));
+    (void)setSolidIfChanged(CRGB(50, 50, 55));
+  } else {
+    bool changed = setSolidIfChanged(nextColor);
+#if CLAUDIAC_DEBUG
+    Serial.print(F("RGB "));
+    Serial.print(nextColor.r);
+    Serial.print(" ");
+    Serial.print(nextColor.g);
+    Serial.print(" ");
+    Serial.println(nextColor.b);
+    if (changed) {
+      Serial.println(F("LED color changed"));
+    } else {
+      Serial.println(F("LED color unchanged"));
+    }
+#endif
+  }
+  g_lastFetchOk = true;
   return true;
 }
 
-void showAttackFlash() {
+static void showAttackFlash() {
   static bool phase = false;
   static uint32_t last = 0;
   uint32_t now = millis();
@@ -159,7 +275,7 @@ void showAttackFlash() {
   FastLED.show();
 }
 
-void showSolidMood() {
+static void showSolidMood() {
   fill_solid(leds, NUM_LEDS, g_solid);
   FastLED.setBrightness(BRIGHTNESS);
   FastLED.show();
@@ -167,34 +283,82 @@ void showSolidMood() {
 
 void setup() {
   Serial.begin(115200);
-  delay(200);
+  delay(300);
+  Serial.println(F("\n\n=== ClaudiacMoodWS2812 ==="));
 
   FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(BRIGHTNESS);
   fill_solid(leds, NUM_LEDS, CRGB(10, 10, 15));
   FastLED.show();
 
-  connectWifi();
+#if STRIP_SELF_TEST
+  Serial.println(F("STRIP_SELF_TEST on"));
+  return;
+#endif
+
+  if (isPlaceholderCredentials()) {
+    Serial.println(F("Edit WIFI_SSID and WIFI_PASSWORD, then re-upload."));
+  } else {
+    (void)tryConnectWifi();
+  }
   lastFetch = 0;
+  lastWifiAttempt = millis();
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    connectWifi();
+#if STRIP_SELF_TEST
+  for (uint8_t i = 0; i < NUM_LEDS; i++) {
+    leds[i] = CHSV(selfTestHue + i * 20, 255, 200);
+  }
+  FastLED.show();
+  selfTestHue++;
+  delay(20);
+  return;
+#endif
+
+  if (isPlaceholderCredentials() || !g_configOk) {
+    showErrorNoWifiCreds();
+    return;
   }
 
-  unsigned long now = millis();
-  if (now - lastFetch >= POLL_MS) {
-    lastFetch = now;
-    if (fetchEmotion()) {
-      Serial.println("poll ok");
+  if (WiFi.status() != WL_CONNECTED) {
+    g_wifiUp = false;
+    if (millis() - lastWifiAttempt > WIFI_RETRY_MS) {
+      lastWifiAttempt = millis();
+      Serial.println(F("Retry WiFi..."));
+      (void)tryConnectWifi();
+    } else {
+      showWifiConnectAttempt();
     }
+    return;
+  }
+  g_wifiUp = true;
+
+  unsigned long now = millis();
+  if (now - lastFetch < POLL_MS) {
+    if (g_attackMode) {
+      showAttackFlash();
+    } else if (!g_lastFetchOk) {
+      showHttpFailPattern();
+    } else {
+      showSolidMood();
+    }
+    return;
+  }
+  lastFetch = now;
+
+  bool ok = fetchEmotion();
+  if (ok) {
+    Serial.println(F("poll ok"));
+  } else {
+    Serial.println(F("fetch failed (HTTP/JSON) — blinking red on strip"));
   }
 
   if (g_attackMode) {
     showAttackFlash();
+  } else if (!g_lastFetchOk) {
+    showHttpFailPattern();
   } else {
-    FastLED.setBrightness(BRIGHTNESS);
     showSolidMood();
   }
 }
